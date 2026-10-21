@@ -788,7 +788,9 @@ async function endConvoy(name){
   const stats = aggregateReport(cases);
   const archivedCount = cases.filter(c=>c.archived).length;
   const dispensedCount = cases.filter(c=>c.pharmacy && c.pharmacy.dispensed).length;
-  const id = "c" + Date.now().toString(36);
+  // لو القافلة معاد فتحها: نحدّث نفس القافلة (نفس الرقم) بدل ما نعمل واحدة جديدة
+  const reopenedId = currentConvoy && currentConvoy.reopenedId ? currentConvoy.reopenedId : null;
+  const id = reopenedId || ("c" + Date.now().toString(36));
   const record = {
     id, name,
     location: currentConvoy ? currentConvoy.location : "",
@@ -828,18 +830,37 @@ async function endConvoy(name){
       if(!already){
         await setJSON("op:"+c.code, opRecord);
         movedToOps++;
+      }else if(reopenedId && already.sourceConvoyId===id && already.status==="pending"){
+        // قافلة معاد فتحها: نحدّث بيانات العملية لو لسه متجدولتش (مثلاً نوع التدخل اتعدّل)
+        await setJSON("op:"+c.code, Object.assign({}, already, opRecord, { addedAt: already.addedAt }));
+        movedToOps++;
+      }else if(reopenedId && already.sourceConvoyId===id){
+        movedToOps++;
       }
     }
   }
 
-  const idx = await loadConvoyIndex();
+  // لو معاد فتحها: الحالات اللي اتشالت منها العملية ولسه متجدولتش — تتشال من العمليات
+  if(reopenedId){
+    const surgeryCodes = new Set(cases.filter(c=>c.needs && c.needs.surgery && c.needs.surgery.needed).map(c=>c.code));
+    try{
+      const ops = await httpStorage.listValues("op:");
+      for(const it of (ops.items||[])){
+        try{
+          const o = JSON.parse(it.value);
+          if(o.sourceConvoyId===id && !surgeryCodes.has(o.code) && o.status==="pending") await httpStorage.delete(it.key);
+        }catch(e){}
+      }
+    }catch(e){}
+  }
+  const idx = (await loadConvoyIndex()).filter(c=>c.id!==id);
   idx.push({ id, name, location: record.location, endedAt: record.endedAt, total: stats.total, movedToOps });
   await saveConvoyIndex(idx);
 
   // فتح ملف تسويات القافلة (4 مراحل) لهذه القافلة تحديدًا — كل قافلة بملفها الخاص
   // برقم/مفتاح مستقل (settlement:<id القافلة>) عشان القافلة الجديدة متتلخبطش
   // بأرقام أو بيانات القافلة اللي قبلها.
-  if(typeof createSettlementForConvoy === "function"){
+  if(!reopenedId && typeof createSettlementForConvoy === "function"){
     try{ await createSettlementForConvoy(id, name, record.location, record.endedAt); }catch(e){}
   }
 
@@ -1145,6 +1166,7 @@ function renderConvoySection(main){
       <div class="counter-card"><div class="num" id="cDispensed">–</div><div class="cap">استلموا أدوية</div></div>
     </div>
     <div id="storageBanner"></div>
+    ${(!volMode && currentConvoy && currentConvoy.reopenedId) ? msgHtml("info", "🔓 القافلة دي (" + (currentConvoy.reopenedName||"") + ") معاد فتحها للتعديل — عدّل اللي محتاجه، وبعدين اقفلها تاني من \"📊 نظرة عامة\" ← إنهاء القافلة.") : ""}
     ${convoySubNav()}
     <div id="convoyMain"></div>
   `;
@@ -2112,7 +2134,7 @@ function renderReport(main){
     area.innerHTML = `
       <div class="field">
         <label>اسم القافلة</label>
-        <input type="text" id="convoyNameInput" placeholder="أدخل اسمًا لتوثيق القافلة">
+        <input type="text" id="convoyNameInput" placeholder="أدخل اسمًا لتوثيق القافلة" value="${escapeHtml((currentConvoy && currentConvoy.reopenedName) || "")}">
       </div>
       <div id="endConvoyMsg"></div>
       <div class="row2">
@@ -2213,6 +2235,26 @@ function renderConvoys(main){
         let linked = { opKeys:[], fuKeys:[] };
         try{ linked = await convoyLinkedCounts(id); }catch(e){}
         if(!wrap.isConnected) return;
+        const reopenCard = document.createElement("div");
+        reopenCard.innerHTML = `
+          <div class="card" style="border:1.5px solid var(--primary);">
+            <h2>🔓 إعادة فتح القافلة للتعديل</h2>
+            <p class="sub">بترجع حالات القافلة دي للتسجيل والأرشيف والصيدلية والنظارات، وتقدر تعدّل فيها أو تضيف حالات. لما تخلص اقفلها تاني من "📊 نظرة عامة" ← إنهاء القافلة، وهتتحدّث نفس القافلة وكشوفها وتسوياتها.</p>
+            ${currentConvoy ? msgHtml("error","فيه قافلة شغالة دلوقتي (" + (currentConvoy.location||"") + ") — اقفلها أو الغيها الأول عشان تقدر تفتح دي.") : ""}
+            <div id="reopenMsg"></div>
+            <button class="btn btn-primary" id="reopenBtn" ${currentConvoy?"disabled":""}>🔓 إعادة فتح القافلة</button>
+          </div>`;
+        wrap.before(reopenCard);
+        const rb = document.getElementById("reopenBtn");
+        if(rb && !currentConvoy) rb.addEventListener("click", async ()=>{
+          if(!confirm("إعادة فتح القافلة دي للتعديل؟")) return;
+          rb.disabled = true; rb.textContent = "جاري الفتح...";
+          let r;
+          try{ r = await reopenConvoy(id); }catch(e){ r = { ok:false, reason:"تعذّر الاتصال — اتأكد من النت" }; }
+          if(!r.ok){ rb.disabled = false; rb.textContent = "🔓 إعادة فتح القافلة"; document.getElementById("reopenMsg").innerHTML = msgHtml("error", r.reason); return; }
+          convoyPage = "archive";
+          render();
+        });
         const n = linked.opKeys.length + linked.fuKeys.length;
         wrap.innerHTML = deleteConvoyCardHtml("ended", n ? `<label class="checkline"><input type="checkbox" id="delWithLinked" checked><span>امسح كمان الحالات اللي اتنقلت منها: ${linked.opKeys.length} في العمليات و${linked.fuKeys.length} في المتابعات</span></label>` : "");
         wireDeleteConvoy(async ()=>{
@@ -5084,6 +5126,36 @@ function wireDeleteConvoy(onConfirm){
   });
 }
 
+/* ======================================================================
+   🔓 إعادة فتح قافلة مقفولة للتعديل — لمدير النظام بس
+   بيرجّع حالات القافلة (من النسخة المحفوظة وقت الإنهاء) للتسجيل والأرشيف
+   والصيدلية والنظارات، وتفضل القافلة شغالة لحد ما تقفلها تاني من "نظرة عامة".
+   التقفيل التاني بيحدّث نفس القافلة (نفس الرقم والتسويات) مش بيعمل قافلة جديدة.
+   ====================================================================== */
+async function reopenConvoy(id){
+  if(currentConvoy) return { ok:false, reason:"فيه قافلة شغالة دلوقتي — اقفلها أو الغيها الأول" };
+  const [rec, cases, msgs] = await Promise.all([ getJSON("convoy:"+id, null), getJSON("convoyCases:"+id, null), getJSON("convoyMsgs:"+id, {}) ]);
+  if(!rec) return { ok:false, reason:"تعذّر العثور على بيانات القافلة" };
+  if(!Array.isArray(cases)) return { ok:false, reason:"القافلة دي اتقفلت قبل تحديث النظام، فحالاتها التفصيلية مش محفوظة ومينفعش تتفتح تاني" };
+  // نرجّع الحالات وعلاماتها
+  const jobs = [];
+  for(const c of cases){
+    jobs.push(()=>setCase(c.code, c));
+    if(c.archived) jobs.push(()=>setFlag("archived:", c.code, true));
+    if(c.pharmacy && c.pharmacy.dispensed) jobs.push(()=>setFlag("dispensed:", c.code, true));
+    if(c.glassesInfo && c.glassesInfo.delivered) jobs.push(()=>setFlag("glassesDelivered:", c.code, true));
+  }
+  Object.entries(msgs||{}).forEach(([code, m])=>jobs.push(()=>setJSON("msg:"+code, m)));
+  for(let i=0;i<jobs.length;i+=8) await Promise.all(jobs.slice(i,i+8).map(f=>f()));
+  medStock = Array.isArray(rec.medStock) ? rec.medStock : [];
+  await saveMedStock();
+  currentConvoy = { location: rec.location||"", startedAt: rec.startedAt || new Date().toISOString(), reopenedId: id, reopenedName: rec.name||"", reopenedAt: new Date().toISOString() };
+  await setJSON(CURRENT_CONVOY_KEY, currentConvoy);
+  // نشيلها من سجل القوافل السابقة لحد ما تتقفل تاني
+  const idx = await loadConvoyIndex();
+  await saveConvoyIndex(idx.filter(c=>c.id!==id));
+  return { ok:true, count: cases.length };
+}
 /* ======================================================================
    الموجّه الرئيسي للتطبيق
    ====================================================================== */
