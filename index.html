@@ -2160,11 +2160,13 @@ function renderConvoys(main){
       <p class="sub">سجلّ القوافل التي تمّت سابقًا — اضغط على أي قافلة لعرض تقريرها</p>
       ${!currentConvoy ? `<button class="btn btn-primary" id="newConvoyBtn">بدء قافلة جديدة</button>` : ""}
     </div>
+    ${currentConvoy && currentRole()==="admin" ? `<details class="card" style="padding:14px 18px;"><summary style="cursor:pointer;font-weight:700;color:#a12a2a;">🗑️ إلغاء القافلة الحالية (${escapeHtml(currentConvoy.location||"")}) من غير حفظ</summary><div style="margin-top:10px;">${deleteConvoyCardHtml("current")}</div></details>` : ""}
     <div id="convoysList"><div class="card"><p class="sub" style="margin:0;">جاري التحميل...</p></div></div>
     <div id="convoyDetail"></div>
   `;
   const newBtn = document.getElementById("newConvoyBtn");
   if(newBtn) newBtn.addEventListener("click", ()=>{ convoyPage="register"; render(); });
+  if(currentConvoy && currentRole()==="admin") wireDeleteConvoy(async ()=>{ await cancelCurrentConvoy(); convoyPage="convoys"; render(); });
 
   loadList();
 
@@ -2203,8 +2205,23 @@ function renderConvoys(main){
           <p class="sub">📍 ${escapeHtml(record.location||"—")} · أُقفلت في ${formatDate(record.endedAt)}</p>
         </div>
         ${statsHtml(record.stats)}
+        ${currentRole()==="admin" ? `<div id="delConvoyWrap"></div>` : ""}
       `;
       box.scrollIntoView({behavior:"smooth", block:"start"});
+      if(currentRole()==="admin"){
+        const wrap = document.getElementById("delConvoyWrap");
+        let linked = { opKeys:[], fuKeys:[] };
+        try{ linked = await convoyLinkedCounts(id); }catch(e){}
+        if(!wrap.isConnected) return;
+        const n = linked.opKeys.length + linked.fuKeys.length;
+        wrap.innerHTML = deleteConvoyCardHtml("ended", n ? `<label class="checkline"><input type="checkbox" id="delWithLinked" checked><span>امسح كمان الحالات اللي اتنقلت منها: ${linked.opKeys.length} في العمليات و${linked.fuKeys.length} في المتابعات</span></label>` : "");
+        wireDeleteConvoy(async ()=>{
+          const withLinked = !!(document.getElementById("delWithLinked") && document.getElementById("delWithLinked").checked);
+          await deleteEndedConvoy(id, withLinked);
+          box.innerHTML = `<div class="card">${msgHtml("success","✓ تم مسح القافلة")}</div>`;
+          loadList();
+        });
+      }
     }catch(e){
       box.innerHTML = `<div class="card">${msgHtml("error","حدث خطأ أثناء تحميل البيانات")}</div>`;
     }
@@ -4989,6 +5006,81 @@ function wireMigrationBlock(){
       box.innerHTML = msgHtml("error","تعذّر الوصول لجوجل شيت القديم: " + e.message);
     }
     btn.disabled = false;
+  });
+}
+
+/* ======================================================================
+   🗑️ مسح قافلة — لمدير النظام بس
+   - قافلة سابقة: بيمسح تقريرها وكشوفها ورسائلها وملف تسوياتها (والمرفقات)،
+     واختياري حالات العمليات والمتابعات اللي اتنقلت منها.
+   - القافلة الحالية: بيلغيها من غير ما يحفظ أي حاجة (مثلاً قافلة تجربة).
+   ====================================================================== */
+async function convoyLinkedCounts(id){
+  const [ops, fus] = await Promise.all([ httpStorage.listValues("op:"), httpStorage.listValues("followup:") ]);
+  const pick = r => (r.items||[]).filter(it=>{ try{ return JSON.parse(it.value).sourceConvoyId===id; }catch(e){ return false; } }).map(it=>it.key);
+  return { opKeys: pick(ops), fuKeys: pick(fus) };
+}
+async function deleteEndedConvoy(id, withLinked){
+  // 1) من سجل القوافل
+  const idx = await loadConvoyIndex();
+  await saveConvoyIndex(idx.filter(c=>c.id!==id));
+  // 2) ملف التسويات + مرفقاته
+  const st = await getJSON("settlement:"+id, null);
+  if(st && Array.isArray(st.attachments)){
+    for(const a of st.attachments){
+      for(let i=0;i<(a.parts||0);i++){ try{ await httpStorage.delete(`file:${a.id}:${i}`); }catch(e){} }
+    }
+  }
+  try{
+    const sidx = await getJSON(SETTLEMENT_INDEX_KEY, []);
+    await setJSON(SETTLEMENT_INDEX_KEY, (sidx||[]).filter(x=>x.convoyId!==id));
+  }catch(e){}
+  // 3) بيانات القافلة نفسها
+  await Promise.all(["convoy:","convoyCases:","convoyMsgs:","settlement:"].map(p=>httpStorage.delete(p+id).catch(()=>null)));
+  // 4) اختياري: العمليات والمتابعات اللي جاية منها
+  if(withLinked){
+    const { opKeys, fuKeys } = await convoyLinkedCounts(id);
+    await Promise.all([...opKeys, ...fuKeys].map(k=>httpStorage.delete(k).catch(()=>null)));
+  }
+  return true;
+}
+async function cancelCurrentConvoy(){
+  for(const p of ["case:","archived:","dispensed:","glassesDelivered:","msg:"]) await deleteAllWithPrefix(p);
+  try{ await httpStorage.delete(CURRENT_CONVOY_KEY); }catch(e){}
+  medStock = [];
+  await saveMedStock();
+  currentConvoy = null;
+  return true;
+}
+
+/* كارت المسح — بيطلب باسورد مدير النظام قبل أي مسح */
+function deleteConvoyCardHtml(kind, extra){
+  const isCur = kind==="current";
+  return `
+    <div class="card" style="border:1.5px solid #e3a5a5;">
+      <h2 style="color:#a12a2a;">🗑️ ${isCur ? "إلغاء القافلة الحالية ومسح بياناتها" : "مسح القافلة دي نهائيًا"}</h2>
+      <p class="sub">${isCur
+        ? "بيمسح كل الحالات اللي اتسجلت في القافلة الشغالة دلوقتي (التسجيل والأرشيف والصيدلية والنظارات والرسائل) من غير ما يحفظ تقرير. استخدمه لقافلة تجربة أو قافلة اتبدأت بالغلط."
+        : "بيمسح تقرير القافلة وكشوفها ورسائلها وملف تسوياتها ومرفقاته. <b>مفيش رجوع بعد المسح.</b>"}</p>
+      ${extra||""}
+      <div class="field"><label>للتأكيد اكتب باسورد مدير النظام</label>
+        <input type="password" id="delConvoyPass" dir="ltr" style="text-align:left;"></div>
+      <div id="delConvoyMsg"></div>
+      <button class="btn btn-danger-outline" id="delConvoyBtn">${isCur ? "إلغاء القافلة ومسح بياناتها" : "مسح القافلة نهائيًا"}</button>
+    </div>`;
+}
+function wireDeleteConvoy(onConfirm){
+  const btn = document.getElementById("delConvoyBtn");
+  if(!btn) return;
+  btn.addEventListener("click", async ()=>{
+    const box = document.getElementById("delConvoyMsg");
+    const pass = document.getElementById("delConvoyPass").value;
+    await loadDeptPasswords();
+    if(!pass || pass !== (deptPasswords && deptPasswords.admin)){ box.innerHTML = msgHtml("error","باسورد مدير النظام غير صحيح"); return; }
+    if(!confirm("متأكد؟ المسح ده مالوش رجوع.")) return;
+    btn.disabled = true; btn.textContent = "جاري المسح...";
+    try{ await onConfirm(); }
+    catch(e){ btn.disabled = false; btn.textContent = "حاول تاني"; box.innerHTML = msgHtml("error","حصلت مشكلة أثناء المسح — اتأكد من النت وجرّب تاني"); }
   });
 }
 
