@@ -566,6 +566,7 @@ async function getCase(code){
 async function setCase(code, data){
   try{
     const r = await httpStorage.set("case:"+code, JSON.stringify(data));
+    if(r && typeof mirrorCaseToSheet==="function") mirrorCaseToSheet(data);   // شيت الإكسيل التلقائي
     return !!r;
   }catch(e){ return false; }
 }
@@ -1325,12 +1326,13 @@ function renderSettings(main){
       </div>
       ${FIREBASE_RULES_HINT}
     </div>
+    ${isAdmin() ? renderExcelSyncBlock() : ""}
     ${isAdmin() ? renderMigrationBlock() : ""}
     ${isAdmin() ? renderPasswordsSettingsBlock() : ""}
   `;
   document.getElementById("saveUrlBtn").addEventListener("click", onSaveUrl);
   document.getElementById("testUrlBtn").addEventListener("click", onTestUrl);
-  if(isAdmin()){ wireMigrationBlock(); wirePasswordsSettingsBlock(); }
+  if(isAdmin()){ wireExcelSyncBlock(); wireMigrationBlock(); wirePasswordsSettingsBlock(); }
 
   async function onSaveUrl(){
     const val = normDbUrl(document.getElementById("s_url").value);
@@ -5208,6 +5210,112 @@ async function reopenConvoy(id){
   return { ok:true, count: cases.length };
 }
 /* ======================================================================
+   📊 مزامنة تلقائية مع شيت إكسيل (Google Sheets)
+   كل حالة بتتسجل أو تتعدل (تسجيل / أرشيف / صيدلية / نظارات) بتتبعت
+   تلقائي لشيت "الحالات". الرابط متسجل في قاعدة البيانات فبيشتغل من كل الأجهزة.
+   ====================================================================== */
+const EXCEL_SYNC_KEY = "excelSync";
+let excelSyncUrl = "";
+async function loadExcelSync(){
+  const cfg = await getJSON(EXCEL_SYNC_KEY, null);
+  excelSyncUrl = (cfg && cfg.url) ? cfg.url : "";
+  return excelSyncUrl;
+}
+function isAppsScriptUrl(u){ return /^https:\/\/script\.google(usercontent)?\.com\/macros\/s\/[^/]+\/exec\/?$/.test(String(u||"").trim()); }
+async function excelPost(payload, url){
+  const res = await fetch(url || excelSyncUrl, { method:"POST", headers:{ "Content-Type":"text/plain;charset=utf-8" }, body: JSON.stringify(payload) });
+  const j = await res.json();
+  if(j && j.error) throw new Error(j.error);
+  return j;
+}
+/* بتتنادى بعد أي حفظ لحالة — من غير ما تأخر المتطوع (مش بنستنى الرد) */
+function mirrorCaseToSheet(c){
+  if(!excelSyncUrl || !c || !c.code) return;
+  const convoy = currentConvoy ? { location: currentConvoy.location||"", startedAt: currentConvoy.startedAt||"" } : {};
+  excelPost({ action:"upsertCase", convoy, case:c }).catch(()=>{});
+}
+
+function renderExcelSyncBlock(){
+  return `
+    <div class="card">
+      <h2>📊 شيت الإكسيل التلقائي</h2>
+      <p class="sub">كل حالة بتتسجل أو تتأرشف أو تستلم دوا أو نظارة بتنزل لوحدها كصف في شيت إكسيل أونلاين (Google Sheets)، وتقدر تنزّله Excel في أي وقت.</p>
+      ${excelSyncUrl ? msgHtml("success","✓ المزامنة شغالة") : msgHtml("info","المزامنة مش متفعّلة لسه — اتبع الخطوات اللي تحت مرة واحدة")}
+      <div class="field"><label>رابط Apps Script بتاع الشيت</label>
+        <input type="text" id="xs_url" value="${escapeHtml(excelSyncUrl)}" placeholder="https://script.google.com/macros/s/.../exec" dir="ltr" style="text-align:left;"></div>
+      <div id="xsMsg"></div>
+      <div class="row2">
+        <button class="btn btn-primary" id="xsSave">حفظ واختبار</button>
+        <button class="btn btn-outline" id="xsSyncAll">⬆️ رفع كل حالات القافلة الحالية للشيت</button>
+      </div>
+      ${excelSyncUrl ? `<button class="btn btn-ghost btn-sm" id="xsOff" style="margin-top:8px;">إيقاف المزامنة</button>` : ""}
+      <details style="margin-top:12px;"><summary style="cursor:pointer;font-weight:700;">خطوات التفعيل (مرة واحدة)</summary>
+        <ol style="font-size:13px;line-height:1.9;padding-right:18px;margin:8px 0 0;">
+          <li>افتح <span dir="ltr">sheets.google.com</span> واعمل شيت جديد فاضي، وسمّيه مثلاً: حالات قوافل شفاء</li>
+          <li>من القايمة اللي فوق: <b>Extensions</b> (الإضافات) ← <b>Apps Script</b></li>
+          <li>امسح الكود اللي هتلاقيه، ودوس الزرار ده والصق مكانه: <button class="btn btn-outline btn-sm" id="xsCopyCode" style="width:auto;">📋 نسخ الكود</button></li>
+          <li>دوس 💾 Save</li>
+          <li>دوس <b>Deploy</b> ← <b>New deployment</b> ← جنب Select type دوس ⚙️ واختار <b>Web app</b></li>
+          <li>عند <b>Who has access</b> اختار <b>Anyone</b>، ودوس <b>Deploy</b></li>
+          <li>هيطلب صلاحيات: <b>Authorize access</b> ← اختار حسابك ← Advanced ← Go to … (unsafe) ← Allow</li>
+          <li>انسخ الرابط اللي تحت <b>Web app URL</b> (بيخلص بـ /exec) والصقه فوق، ودوس <b>حفظ واختبار</b></li>
+        </ol>
+      </details>
+    </div>`;
+}
+function wireExcelSyncBlock(){
+  const box = ()=>document.getElementById("xsMsg");
+  const copyBtn = document.getElementById("xsCopyCode");
+  if(copyBtn) copyBtn.addEventListener("click", async (e)=>{
+    e.preventDefault();
+    try{ await navigator.clipboard.writeText(EXCEL_SYNC_CODE); copyBtn.textContent = "✓ اتنسخ"; }
+    catch(err){
+      const ta = document.createElement("textarea"); ta.value = EXCEL_SYNC_CODE; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove();
+      copyBtn.textContent = "✓ اتنسخ";
+    }
+  });
+  document.getElementById("xsSave").addEventListener("click", async ()=>{
+    const url = document.getElementById("xs_url").value.trim();
+    if(!isAppsScriptUrl(url)){ box().innerHTML = msgHtml("error","الرابط لازم يبدأ بـ https://script.google.com/macros/s/ ويخلص بـ /exec"); return; }
+    const btn = document.getElementById("xsSave"); btn.disabled = true; btn.textContent = "جاري الاختبار...";
+    try{
+      const r = await fetch(url).then(x=>x.json());
+      if(!r || r.app!=="shifa-excel-sync") throw new Error("الرابط ده مش بتاع كود شفاء — اتأكد إنك لصقت الكود الصح وعملت Deploy");
+      await setJSON(EXCEL_SYNC_KEY, { url, savedAt:new Date().toISOString() });
+      excelSyncUrl = url;
+      box().innerHTML = msgHtml("success","✓ اتربط — أي حالة جديدة هتنزل في الشيت تلقائي. لو فيه حالات متسجلة قبل كده دوس \"رفع كل حالات القافلة الحالية\".");
+    }catch(e){
+      box().innerHTML = msgHtml("error", e.message && !/fetch|JSON/i.test(e.message) ? e.message : "تعذّر الوصول للرابط — اتأكد إن Who has access = Anyone وإن الرابط بيخلص بـ /exec");
+    }
+    btn.disabled = false; btn.textContent = "حفظ واختبار";
+  });
+  document.getElementById("xsSyncAll").addEventListener("click", async ()=>{
+    if(!excelSyncUrl){ box().innerHTML = msgHtml("error","فعّل المزامنة الأول"); return; }
+    if(!currentConvoy){ box().innerHTML = msgHtml("error","مفيش قافلة شغالة دلوقتي"); return; }
+    const btn = document.getElementById("xsSyncAll"); btn.disabled = true;
+    try{
+      const cases = (await fetchAllCases()).sort(byCode);
+      const convoy = { location: currentConvoy.location||"", startedAt: currentConvoy.startedAt||"" };
+      for(let i=0;i<cases.length;i+=50){
+        box().innerHTML = msgHtml("info", `جاري الرفع... ${Math.min(i+50, cases.length)} من ${cases.length}`);
+        await excelPost({ action:"bulk", convoy, cases: cases.slice(i, i+50) });
+      }
+      box().innerHTML = msgHtml("success", `✓ اترفع ${cases.length} حالة للشيت`);
+    }catch(e){ box().innerHTML = msgHtml("error","حصلت مشكلة أثناء الرفع — جرّب تاني"); }
+    btn.disabled = false;
+  });
+  const off = document.getElementById("xsOff");
+  if(off) off.addEventListener("click", async ()=>{
+    if(!confirm("إيقاف المزامنة مع الشيت؟ الحالات اللي في الشيت هتفضل زي ما هي.")) return;
+    await setJSON(EXCEL_SYNC_KEY, { url:"" }); excelSyncUrl = "";
+    renderSettings(document.getElementById("convoyMain"));
+  });
+}
+
+
+const EXCEL_SYNC_CODE = "/* نظام شفاء — مزامنة الحالات مع شيت جوجل (إكسيل أونلاين)\n   كل حالة بتتسجل أو تتعدل في السيستم بتنزل هنا تلقائي كصف في شيت \"الحالات\".\n   الشيت ده للعرض والتحميل بس — البيانات الأساسية متخزنة في Firebase. */\nvar SHEET_NAME = \"الحالات\";\nvar HEADERS = [\"المعرف\",\"القافلة\",\"تاريخ القافلة\",\"الكود\",\"الاسم\",\"الرقم القومي\",\"السن\",\"رقم الهاتف\",\"رقم هاتف آخر\",\n  \"وقت التسجيل\",\"سجلها\",\"تمت الأرشفة\",\"وقت الأرشفة\",\"أرشفها\",\"يحتاج عملية\",\"نوع التدخل\",\"العين\",\"يحتاج نظارة\",\n  \"الأدوية\",\"صرفت الأدوية\",\"استلمت النظارة\",\"آخر تحديث\"];\n\nfunction doGet(e){ return out_({ ok:true, app:\"shifa-excel-sync\" }); }\n\nfunction doPost(e){\n  var p;\n  try{ p = JSON.parse(e.postData.contents); }catch(err){ return out_({ error:\"bad request\" }); }\n  var lock = LockService.getScriptLock();\n  lock.waitLock(25000);\n  try{\n    var sh = sheet_();\n    if(p.action === \"upsertCase\"){ upsert_(sh, p[\"case\"], p.convoy || {}); return out_({ ok:true }); }\n    if(p.action === \"bulk\"){\n      var list = p.cases || [];\n      for(var i=0;i<list.length;i++) upsert_(sh, list[i], p.convoy || {});\n      return out_({ ok:true, count:list.length });\n    }\n    return out_({ error:\"unknown action\" });\n  }finally{ lock.releaseLock(); }\n}\n\nfunction out_(o){ return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }\nfunction sheet_(){\n  var ss = SpreadsheetApp.getActiveSpreadsheet();\n  var sh = ss.getSheetByName(SHEET_NAME);\n  if(!sh){\n    sh = ss.insertSheet(SHEET_NAME);\n    sh.getRange(1,1,1,HEADERS.length).setValues([HEADERS]).setFontWeight(\"bold\");\n    sh.setFrozenRows(1);\n    sh.setRightToLeft(true);\n  }\n  return sh;\n}\nfunction fmt_(iso){\n  if(!iso) return \"\";\n  try{ return Utilities.formatDate(new Date(iso), \"Africa/Cairo\", \"yyyy-MM-dd HH:mm\"); }catch(e){ return String(iso); }\n}\nfunction dose_(n){\n  n = parseInt(n,10) || 0;\n  if(!n) return \"\";\n  if(n === 1) return \"مرة واحدة في اليوم\";\n  if(n === 2) return \"مرتين في اليوم\";\n  return n + (n <= 10 ? \" مرات\" : \" مرة\") + \" في اليوم\";\n}\nfunction upsert_(sh, c, conv){\n  if(!c || !c.code) return;\n  var id = (conv.startedAt || \"\") + \"|\" + c.code;\n  var r = 0;\n  if(sh.getLastRow() > 1){\n    var f = sh.getRange(2,1,sh.getLastRow()-1,1).createTextFinder(id).matchEntireCell(true).matchCase(true).findNext();\n    if(f) r = f.getRow();\n  }\n  var n = c.needs || {}, s = n.surgery || {};\n  var meds = (n.medications || []).map(function(m){\n    return m.type + \" ×\" + (m.boxes || 1) + (m.perDay ? \" — \" + dose_(m.perDay) : \"\");\n  }).join(\"، \");\n  var row = [id, conv.location || \"\", fmt_(conv.startedAt), c.code, c.name || \"\", \"'\" + (c.nationalId || \"\"), c.age || \"\",\n    \"'\" + (c.phone || \"\"), c.phone2 ? \"'\" + c.phone2 : \"\",\n    fmt_(c.registeredAt), c.registeredBy || \"\", c.archived ? \"نعم\" : \"لا\", fmt_(c.archivedAt), c.archivedBy || \"\",\n    s.needed ? \"نعم\" : \"لا\", s.type || \"\", s.eye || \"\", n.glasses ? \"نعم\" : \"لا\", meds,\n    (c.pharmacy && c.pharmacy.dispensed) ? \"نعم\" : \"لا\", (c.glassesInfo && c.glassesInfo.delivered) ? \"نعم\" : \"لا\",\n    Utilities.formatDate(new Date(), \"Africa/Cairo\", \"yyyy-MM-dd HH:mm\")];\n  if(r) sh.getRange(r,1,1,row.length).setValues([row]);\n  else sh.appendRow(row);\n}\n";
+
+/* ======================================================================
    الموجّه الرئيسي للتطبيق
    ====================================================================== */
 let currentSection = "hub"; // hub | explain | convoy | ops | closing | followups | admin | prep | chief
@@ -5247,6 +5355,7 @@ async function init(){
     await loadDeptPasswords();
     await loadPageLocks();
     await loadPrepChecklists();
+    try{ await loadExcelSync(); }catch(e){}
   }
   render();
 }
