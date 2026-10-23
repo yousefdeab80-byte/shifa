@@ -1560,6 +1560,7 @@ function renderRegister(main){
 }
 
 /* ================= ARCHIVE PAGE ================= */
+const SURGERY_TYPES = ["مياه بيضاء","ظفرة","مياه زرقاء","مسحة"];
 function renderArchive(main){
   main.innerHTML = `
     <div class="card">
@@ -1630,8 +1631,15 @@ function renderArchive(main){
         </label>
         <div id="surgeryTypeWrap" style="display:${archiveState.surgery?"block":"none"}; margin-right:30px;">
           <div class="field">
-            <label>نوع التدخل</label>
-            <input type="text" id="f_surgeryType" placeholder="مثال: مياه بيضاء" value="${escapeHtml(archiveState.surgeryType)}">
+            <label>نوع العملية</label>
+            ${(()=>{ const known = SURGERY_TYPES.includes(archiveState.surgeryType);
+                     const sel = archiveState.surgeryType ? (known ? archiveState.surgeryType : "أخرى") : "";
+                     return `<select id="f_surgerySel">
+                       <option value="">اختار نوع العملية</option>
+                       ${SURGERY_TYPES.concat(["أخرى"]).map(t=>`<option value="${t}" ${sel===t?"selected":""}>${t}</option>`).join("")}
+                     </select>
+                     <input type="text" id="f_surgeryOther" placeholder="اكتب نوع العملية" style="margin-top:8px;display:${sel==="أخرى"?"block":"none"};" value="${escapeHtml(known ? "" : archiveState.surgeryType)}">
+                     <input type="hidden" id="f_surgeryType" value="${escapeHtml(archiveState.surgeryType)}">`; })()}
           </div>
           <div class="field">
             <label>العين</label>
@@ -1672,6 +1680,17 @@ function renderArchive(main){
     if(archiveState.meds.length===0) archiveState.meds=[{type:"",boxes:1,perDay:""}];
     renderMedRows();
 
+    // نوع العملية: اختيار ثابت، ولو "أخرى" يتكتب
+    const syncSurgeryType = ()=>{
+      const v = document.getElementById("f_surgerySel").value;
+      const other = document.getElementById("f_surgeryOther");
+      other.style.display = v==="أخرى" ? "block" : "none";
+      const val = v==="أخرى" ? other.value.trim() : v;
+      document.getElementById("f_surgeryType").value = val;
+      archiveState.surgeryType = val;
+    };
+    document.getElementById("f_surgerySel").addEventListener("change", ()=>{ syncSurgeryType(); if(document.getElementById("f_surgerySel").value==="أخرى") document.getElementById("f_surgeryOther").focus(); });
+    document.getElementById("f_surgeryOther").addEventListener("input", syncSurgeryType);
     document.getElementById("chk_surgery").addEventListener("change",(e)=>{
       archiveState.surgery = e.target.checked;
       document.getElementById("surgeryTypeWrap").style.display = e.target.checked?"block":"none";
@@ -1739,7 +1758,7 @@ function renderArchive(main){
     const wantsMeds = document.getElementById("chk_meds").checked;
 
     if(needsSurgery && !surgeryType){
-      msgBox.innerHTML = msgHtml("error","يُرجى كتابة نوع التدخل المطلوب");
+      msgBox.innerHTML = msgHtml("error", document.getElementById("f_surgerySel") && document.getElementById("f_surgerySel").value==="أخرى" ? "يُرجى كتابة نوع العملية في خانة أخرى" : "يُرجى اختيار نوع العملية");
       return;
     }
     if(needsSurgery && !eye){
